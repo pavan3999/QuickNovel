@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Cancel previous runs
-        uses: styfle/cancel-workflow-action@0.5.0
+        uses: styfle/cancel-workflow-action
         with:
           access_token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -54,33 +54,43 @@ jobs:
           path = Path("app/build.gradle")
           text = path.read_text()
 
-          marker = '''    defaultConfig {
-              applicationId "com.lagradost.quicknovel"'''
-
-          replacement = '''    defaultConfig {
-              ndk {
-                  abiFilters "arm64-v8a"
-              }
-
-              applicationId "com.lagradost.quicknovel"'''
+          marker = "defaultConfig {"
 
           if marker not in text:
-              raise SystemExit("Could not find defaultConfig marker")
+              raise SystemExit("Could not find defaultConfig")
 
-          path.write_text(text.replace(marker, replacement, 1))
+          text = text.replace(
+              marker,
+              '''defaultConfig {
+                  ndk {
+                      abiFilters "arm64-v8a"
+                  }''',
+              1
+          )
+
+          path.write_text(text)
+
+          print("Configured ARM64-v8a only")
           PY
+
+      - name: Verify ARM64 configuration
+        run: |
+          grep -A8 -B2 'defaultConfig' app/build.gradle
 
       - name: Build ARM64 Release
         run: ./gradlew assembleRelease
 
       - name: Rename app
         run: |
-          cd app/build/outputs/apk/release
-          mv app-release-unsigned.apk QuickNovel.apk
+          mv app/build/outputs/apk/release/app-release-unsigned.apk \
+             app/build/outputs/apk/release/QuickNovel.apk
+
+      - name: Verify APK
+        run: |
+          ls -lh app/build/outputs/apk/release/QuickNovel.apk
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: QuickNovel
+          name: QuickNovel-arm64-v8a
           path: app/build/outputs/apk/release/QuickNovel.apk
-          
