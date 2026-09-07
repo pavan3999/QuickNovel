@@ -63,6 +63,7 @@ jobs:
         uses: actions/setup-java@v6
         with:
           java-version: 11
+          distribution: temurin
 
       - name: Build app
         uses: eskatos/gradle-command-action@v1
