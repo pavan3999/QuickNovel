@@ -1,7 +1,6 @@
 name: Build App
 
 on:
-  # Manual triggers
   workflow_dispatch:
     inputs:
       git-ref:
@@ -22,6 +21,10 @@ jobs:
         with:
           access_token: ${{ secrets.GITHUB_TOKEN }}
 
+      # ------------------------------------------------------------
+      # Checkout upstream QuickNovel
+      # ------------------------------------------------------------
+
       - name: Clone Repository (Latest)
         uses: actions/checkout@v7
         if: github.event.inputs.git-ref == ''
@@ -37,65 +40,142 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.inputs.git-ref }}
 
+      # ------------------------------------------------------------
+      # Java / Gradle
+      # ------------------------------------------------------------
+
       - name: Set up JDK 17
         uses: actions/setup-java@v6
         with:
           java-version: '17'
           distribution: temurin
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # ------------------------------------------------------------
+      # Find latest release in YOUR repository
+      # ------------------------------------------------------------
+
       - name: Get previous release
         id: last_release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -e
+
           TAG=$(gh release list \
             --repo "${{ github.repository }}" \
             --exclude-drafts \
             --exclude-pre-releases \
             --limit 100 \
             --json tagName \
-            --jq '[.[].tagName | select(test("^r[0-9]+$"))][0]'
-          )
+            --jq '
+              [.[].tagName
+              | select(test("^r[0-9]+$"))
+              | ltrimstr("r")
+              | tonumber]
+              | if length > 0 then max else 0 end
+              | "r\(.)"
+            ')
 
-          echo "Found preview tag: $TAG"
-
-          echo "tag_name=${TAG:-r0}" >> "$GITHUB_OUTPUT"
+          echo "Latest release tag: $TAG"
+          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Debug previous release
         run: |
-          echo "Repository: ${{ github.repository }}"
-          echo "Previous tag: '${{ steps.last_release.outputs.tag_name }}'"
+          echo "Release repository: ${{ github.repository }}"
+          echo "Previous release tag: '${{ steps.last_release.outputs.tag_name }}'"
 
-      - name: Prepare build metadata
+      # ------------------------------------------------------------
+      # Determine previous upstream commit
+      # ------------------------------------------------------------
+
+      - name: Get previous upstream SHA
+        id: previous_sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_TAG: ${{ steps.last_release.outputs.tag_name }}
         run: |
           set -e
 
-          commit_count=$(git rev-list --count HEAD)
-          echo "COMMIT_COUNT=$commit_count" >> "$GITHUB_ENV"
+          if [ "$PREVIOUS_TAG" = "r0" ]; then
+            echo "No previous real release found."
 
-          current_sha=$(git rev-parse --short HEAD)
-          echo "CURRENT_SHA=$current_sha" >> "$GITHUB_ENV"
+            # First commit of upstream repository
+            PREV_SHA=$(git rev-list --max-parents=0 HEAD | tail -n 1)
 
-          prev_tag="${{ steps.last_release.outputs.tag_name }}"
-          prev_commit_count=$(echo "${prev_tag:-r0}" | sed -e 's/^r//')
+            echo "Using first upstream commit: $PREV_SHA"
+          else
+            echo "Reading upstream SHA from release $PREVIOUS_TAG"
 
-          commit_count_diff=$((commit_count - prev_commit_count))
-          if [ "$commit_count_diff" -lt 0 ]; then
-            commit_count_diff=0
+            RELEASE_BODY=$(gh release view "$PREVIOUS_TAG" \
+              --repo "${{ github.repository }}" \
+              --json body \
+              --jq '.body')
+
+            PREV_SHA=$(printf '%s\n' "$RELEASE_BODY" \
+              | grep -oE 'Upstream commit: `[0-9a-fA-F]+`' \
+              | head -n 1 \
+              | sed -E 's/.*`([0-9a-fA-F]+)`.*/\1/')
+
+            if [ -z "$PREV_SHA" ]; then
+              echo "ERROR: Could not find 'Upstream commit:' in $PREVIOUS_TAG."
+              echo
+              echo "Release body:"
+              echo "$RELEASE_BODY"
+              exit 1
+            fi
+
+            echo "Previous upstream SHA: $PREV_SHA"
           fi
 
-          prev_release_sha=$(git rev-parse --short HEAD~$commit_count_diff)
-          echo "PREV_RELEASE_SHA=$prev_release_sha" >> "$GITHUB_ENV"
+          echo "prev_sha=$PREV_SHA" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # Current upstream build metadata
+      # ------------------------------------------------------------
+
+      - name: Prepare build metadata
+        env:
+          PREV_SHA: ${{ steps.previous_sha.outputs.prev_sha }}
+        run: |
+          set -e
+
+          CURRENT_SHA=$(git rev-parse HEAD)
+          CURRENT_SHORT_SHA=$(git rev-parse --short HEAD)
+
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+
+          echo "CURRENT_SHA=$CURRENT_SHORT_SHA" >> "$GITHUB_ENV"
+          echo "COMMIT_COUNT=$COMMIT_COUNT" >> "$GITHUB_ENV"
+          echo "PREV_RELEASE_SHA=$PREV_SHA" >> "$GITHUB_ENV"
+
+          echo "Current upstream SHA: $CURRENT_SHA"
+          echo "Current short SHA: $CURRENT_SHORT_SHA"
+          echo "Upstream commit count: $COMMIT_COUNT"
+          echo "Previous upstream SHA: $PREV_SHA"
 
           echo "COMMIT_LOGS<<EOF" >> "$GITHUB_ENV"
-          curl -s -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/LagradOst/QuickNovel/compare/$prev_release_sha...$current_sha" \
-            | jq '[.commits[] | {message:(.commit.message | split("\n")), username:.author.login}]' \
-            | jq -r '.[] | "- \(.message | first) (@\(.username))"' >> "$GITHUB_ENV"
+
+          if [ "$PREV_SHA" = "$CURRENT_SHA" ]; then
+            echo "- No upstream changes since the previous release." >> "$GITHUB_ENV"
+          else
+            curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/LagradOst/QuickNovel/compare/$PREV_SHA...$CURRENT_SHA" \
+              | jq -r '
+                  .commits[] |
+                  "- \(.commit.message | split("\n")[0]) (@\(.author.login // "unknown"))"
+                ' >> "$GITHUB_ENV"
+          fi
+
           echo "EOF" >> "$GITHUB_ENV"
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v6
+      # ------------------------------------------------------------
+      # Configure ARM64-only build
+      # ------------------------------------------------------------
 
       - name: Configure ARM64 only
         run: |
@@ -126,16 +206,54 @@ jobs:
 
       - name: Verify ARM64 configuration
         run: |
+          echo "Checking ARM64 configuration..."
           grep -A8 -B2 'defaultConfig' app/build.gradle
 
-      - name: Build Release
-        run: ./gradlew assembleRelease
+          grep -q 'abiFilters "arm64-v8a"' app/build.gradle
+
+          echo "ARM64 configuration verified."
+
+      # ------------------------------------------------------------
+      # Build
+      # ------------------------------------------------------------
+
+      - name: Build ARM64 Release
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          ./gradlew assembleRelease
+
+      - name: Verify unsigned APK
+        run: |
+          set -e
+
+          APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+
+          test -f "$APK"
+
+          echo "Unsigned APK found:"
+          ls -lh "$APK"
+
+      # ------------------------------------------------------------
+      # Signing
+      # ------------------------------------------------------------
 
       - name: Decode signing keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
+          set -e
+
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "ERROR: KEYSTORE_BASE64 secret is not configured."
+            exit 1
+          fi
+
           echo "$KEYSTORE_BASE64" | base64 --decode > release.jks
+
+          test -s release.jks
+
+          echo "Keystore decoded successfully."
 
       - name: Sign APK
         env:
@@ -145,49 +263,103 @@ jobs:
         run: |
           set -e
 
-          APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          INPUT_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          OUTPUT_APK="QuickNovel-arm64-v8a-r${{ env.COMMIT_COUNT }}.apk"
 
-          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" \
+            -type f \
+            -name apksigner \
+            | sort -V \
+            | tail -n 1)
 
-          echo "Using: $APKSIGNER"
+          if [ -z "$APKSIGNER" ]; then
+            echo "ERROR: apksigner not found."
+            exit 1
+          fi
+
+          echo "Using apksigner:"
+          echo "$APKSIGNER"
 
           "$APKSIGNER" sign \
             --ks release.jks \
             --ks-key-alias "$KEY_ALIAS" \
             --ks-pass "pass:$KEYSTORE_PASSWORD" \
             --key-pass "pass:$KEY_PASSWORD" \
-            --out QuickNovel-arm64-v8a-r${{ env.COMMIT_COUNT }}.apk \
-            "$APK"
+            --out "$OUTPUT_APK" \
+            "$INPUT_APK"
+
+          test -f "$OUTPUT_APK"
+
+          echo "Signed APK created:"
+          ls -lh "$OUTPUT_APK"
 
       - name: Verify signed APK
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
           set -e
 
-          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          APK="QuickNovel-arm64-v8a-r${{ env.COMMIT_COUNT }}.apk"
 
-          "$APKSIGNER" verify --verbose \
-            QuickNovel-arm64-v8a-r${{ env.COMMIT_COUNT }}.apk
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" \
+            -type f \
+            -name apksigner \
+            | sort -V \
+            | tail -n 1)
 
-          ls -lh QuickNovel-arm64-v8a-r${{ env.COMMIT_COUNT }}.apk
+          "$APKSIGNER" verify --verbose "$APK"
+
+          echo "APK signature verified successfully."
+
+      # ------------------------------------------------------------
+      # Checksum
+      # ------------------------------------------------------------
 
       - name: Calculate SHA-256
         run: |
-          sha=$(sha256sum QuickNovel-arm64-v8a-r${{ env.COMMIT_COUNT }}.apk | awk '{ print $1 }')
-          echo "APK_ARM64_SHA=$sha" >> "$GITHUB_ENV"
+          set -e
+
+          APK="QuickNovel-arm64-v8a-r${{ env.COMMIT_COUNT }}.apk"
+
+          SHA=$(sha256sum "$APK" | awk '{ print $1 }')
+
+          echo "APK SHA-256:"
+          echo "$SHA"
+
+          echo "APK_ARM64_SHA=$SHA" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------
+      # Cleanup secret material
+      # ------------------------------------------------------------
 
       - name: Delete keystore
         if: always()
-        run: rm -f release.jks
+        run: |
+          rm -f release.jks
+
+      # ------------------------------------------------------------
+      # Create GitHub Release
+      # ------------------------------------------------------------
 
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: r${{ env.COMMIT_COUNT }}
           name: QuickNovel Preview r${{ env.COMMIT_COUNT }}
-          body: |
-            ### Commits
 
+          body: |
+            ### Upstream
+
+            Repository: https://github.com/LagradOst/QuickNovel
+
+            Upstream commit: `${{ env.CURRENT_SHA }}`
+
+            Previous upstream commit: `${{ env.PREV_RELEASE_SHA }}`
+
+            Compare:
             https://github.com/LagradOst/QuickNovel/compare/${{ env.PREV_RELEASE_SHA }}...${{ env.CURRENT_SHA }}
+
+            ### Commits
 
             ${{ env.COMMIT_LOGS }}
 
@@ -195,12 +367,15 @@ jobs:
 
             ### Checksums
 
-            | Variant   | SHA-256 |
-            |-----------|----------|
+            | Variant | SHA-256 |
+            |---------|---------|
             | arm64-v8a | ${{ env.APK_ARM64_SHA }} |
 
           files: QuickNovel-arm64-v8a-r${{ env.COMMIT_COUNT }}.apk
+
           draft: ${{ github.event.inputs.dry-run != '' }}
+
           prerelease: false
+
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
