@@ -65,13 +65,11 @@ jobs:
           java-version: 11
           distribution: temurin
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
       - name: Build app
-        uses: eskatos/gradle-command-action@v1
-        with:
-          arguments: assembleRelease
-          distributions-cache-enabled: true
-          dependencies-cache-enabled: true
-          configuration-cache-enabled: true
+        run: ./gradlew assembleRelease
 
       - name: Rename app
         run: |
