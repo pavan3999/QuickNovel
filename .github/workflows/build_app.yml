@@ -12,31 +12,8 @@ on:
         required: false
 
 jobs:
-  check_wrapper:
-    name: Validate Gradle Wrapper
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Clone Repository (Latest)
-        uses: actions/checkout@v7
-        with:
-          repository: 'LagradOst/QuickNovel'
-          fetch-depth: 0
-        if: github.event.inputs.git-ref == ''
-      - name: Clone Repository (Custom Ref)
-        uses: actions/checkout@v7
-        if: github.event.inputs.git-ref != ''
-        with:
-          repository: 'LagradOst/QuickNovel'
-          fetch-depth: 0
-          ref: ${{ github.event.inputs.git-ref }}
-
-      - name: Validate Gradle Wrapper
-        uses: gradle/actions/setup-gradle@v6
-
   build:
     name: Build app
-    needs: check_wrapper
     runs-on: ubuntu-latest
 
     steps:
@@ -47,10 +24,11 @@ jobs:
 
       - name: Clone Repository (Latest)
         uses: actions/checkout@v7
+        if: github.event.inputs.git-ref == ''
         with:
           repository: 'LagradOst/QuickNovel'
           fetch-depth: 0
-        if: github.event.inputs.git-ref == ''
+
       - name: Clone Repository (Custom Ref)
         uses: actions/checkout@v7
         if: github.event.inputs.git-ref != ''
@@ -68,15 +46,41 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Build app
+      - name: Configure ARM64 only
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("app/build.gradle")
+          text = path.read_text()
+
+          marker = '''    defaultConfig {
+              applicationId "com.lagradost.quicknovel"'''
+
+          replacement = '''    defaultConfig {
+              ndk {
+                  abiFilters "arm64-v8a"
+              }
+
+              applicationId "com.lagradost.quicknovel"'''
+
+          if marker not in text:
+              raise SystemExit("Could not find defaultConfig marker")
+
+          path.write_text(text.replace(marker, replacement, 1))
+          PY
+
+      - name: Build ARM64 Release
         run: ./gradlew assembleRelease
 
       - name: Rename app
         run: |
           cd app/build/outputs/apk/release
           mv app-release-unsigned.apk QuickNovel.apk
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:
           name: QuickNovel
           path: app/build/outputs/apk/release/QuickNovel.apk
+          
